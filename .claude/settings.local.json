@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(if not exist \"c:\\\\Work\\\\Airtable\\\\src\\\\services\" mkdir \"c:\\\\Work\\\\Airtable\\\\src\\\\services\")",
+      "Bash(if not exist \"c:\\\\Work\\\\Airtable\\\\src\\\\routes\" mkdir \"c:\\\\Work\\\\Airtable\\\\src\\\\routes\")",
+      "Bash(if not exist \"c:\\\\Work\\\\Airtable\\\\src\\\\utils\" mkdir \"c:\\\\Work\\\\Airtable\\\\src\\\\utils\")",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}
