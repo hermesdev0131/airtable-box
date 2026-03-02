@@ -47,17 +47,17 @@ router.post("/webhook", async (req: Request, res: Response) => {
   const { recordId, tableName } = validation.payload;
   log.info(`Webhook received for record ${recordId}`);
 
-  // ── Respond early ───────────────────────────────────────────────────────
-  res.status(200).json({
-    ok: true,
-    requestId,
-    recordId,
-    message: "Processing started",
-  });
-
-  // ── Process asynchronously (same execution context) ─────────────────────
+  // ── Process synchronously, then respond ────────────────────────────────
+  // Vercel terminates serverless functions after the response is sent,
+  // so we must complete all work BEFORE calling res.json().
   try {
     await processRecord(recordId, requestId, tableName, log);
+    res.status(200).json({
+      ok: true,
+      requestId,
+      recordId,
+      message: "Processing complete",
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     log.error(`Unhandled error processing ${recordId}: ${msg}`);
@@ -69,6 +69,12 @@ router.post("/webhook", async (req: Request, res: Response) => {
         statusErr instanceof Error ? statusErr.message : String(statusErr);
       log.error(`Failed to set Failed status: ${statusMsg}`);
     }
+    res.status(500).json({
+      ok: false,
+      requestId,
+      recordId,
+      error: msg,
+    });
   }
 });
 
