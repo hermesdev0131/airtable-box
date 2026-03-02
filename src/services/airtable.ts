@@ -9,6 +9,8 @@ export interface AirtableAttachment {
   filename: string;
   size: number;
   type: string;
+  /** The Airtable field this attachment came from */
+  fieldName: string;
 }
 
 export interface AirtableRecord {
@@ -24,23 +26,48 @@ interface AirtableConfig {
   apiKey: string;
   baseId: string;
   tableName: string;
-  attachmentsField: string;
+  /** Comma-separated list of attachment field names */
+  attachmentFields: string[];
   statusField: string;
   errorField: string;
-  boxLinksField: string;
-  boxIdsField: string;
+  boxFilePathField: string;
+  fundField: string;
+  companyCodeField: string;
+  companyNameJpField: string;
+  submissionPeriodField: string;
 }
 
+const DEFAULT_ATTACHMENT_FIELDS = [
+  " 株主名簿（最新版）",
+  "PL・誓約書",
+  "バランスシート・誓約書",
+  "商業登記簿",
+  "新株予約権原簿を",
+];
+
 export function getAirtableConfig(): AirtableConfig {
+  const attachmentFieldsEnv = process.env.AIRTABLE_ATTACHMENT_FIELDS;
+  const attachmentFields = attachmentFieldsEnv
+    ? attachmentFieldsEnv.split(",").map((s) => s.trim())
+    : DEFAULT_ATTACHMENT_FIELDS;
+
   return {
     apiKey: requireEnv("AIRTABLE_API_KEY"),
     baseId: requireEnv("AIRTABLE_BASE_ID"),
-    tableName: requireEnv("AIRTABLE_TABLE_NAME"),
-    attachmentsField: process.env.AIRTABLE_ATTACHMENTS_FIELD || "Files",
-    statusField: process.env.AIRTABLE_STATUS_FIELD || "Status",
+    tableName: process.env.AIRTABLE_TABLE_NAME || "ドキュメント収集管理",
+    attachmentFields,
+    statusField: process.env.AIRTABLE_STATUS_FIELD || "収集状況管理",
     errorField: process.env.AIRTABLE_ERROR_FIELD || "ErrorMessage",
-    boxLinksField: process.env.AIRTABLE_BOX_LINKS_FIELD || "BoxLinks",
-    boxIdsField: process.env.AIRTABLE_BOX_IDS_FIELD || "BoxFileIds",
+    boxFilePathField: process.env.AIRTABLE_BOX_FILE_PATH_FIELD || "Boxファイルパス",
+    fundField: process.env.AIRTABLE_FUND_FIELD || "Fund / ファンド (from 会社名)",
+    companyCodeField:
+      process.env.AIRTABLE_COMPANY_CODE_FIELD ||
+      "Company Code / 会社コード (from 会社名)",
+    companyNameJpField:
+      process.env.AIRTABLE_COMPANY_NAME_JP_FIELD ||
+      "Company Name (JP) / 会社名（日本語） (from 会社名)",
+    submissionPeriodField:
+      process.env.AIRTABLE_SUBMISSION_PERIOD_FIELD || "提出期間",
   };
 }
 
@@ -139,15 +166,13 @@ export async function getRecord(
 }
 
 /**
- * Extract attachment objects from a record's attachment field.
+ * Extract attachment objects from a single attachment field.
  */
-export function getAttachments(
+function parseAttachmentField(
   record: AirtableRecord,
-  attachmentsField?: string
+  fieldName: string
 ): AirtableAttachment[] {
-  const cfg = getAirtableConfig();
-  const field = attachmentsField || cfg.attachmentsField;
-  const raw = record.fields[field];
+  const raw = record.fields[fieldName];
   if (!Array.isArray(raw)) return [];
   return raw.map((a: Record<string, unknown>) => ({
     id: String(a.id || ""),
@@ -155,7 +180,20 @@ export function getAttachments(
     filename: String(a.filename || "unknown"),
     size: Number(a.size) || 0,
     type: String(a.type || "application/octet-stream"),
+    fieldName,
   }));
+}
+
+/**
+ * Extract attachments from ALL configured attachment fields.
+ */
+export function getAllAttachments(record: AirtableRecord): AirtableAttachment[] {
+  const cfg = getAirtableConfig();
+  const all: AirtableAttachment[] = [];
+  for (const field of cfg.attachmentFields) {
+    all.push(...parseAttachmentField(record, field));
+  }
+  return all;
 }
 
 /**
@@ -169,33 +207,61 @@ export function getStatus(record: AirtableRecord): ProcessingStatus | null {
 }
 
 /**
- * Read existing Box file IDs stored on the record.
+ * Read the fund name (e.g. "4号") from a record.
+ * Handles both direct string values and lookup arrays (e.g. ["4号"]).
  */
-export function getExistingBoxIds(record: AirtableRecord): string[] {
+export function getFundName(record: AirtableRecord): string | null {
   const cfg = getAirtableConfig();
-  const val = record.fields[cfg.boxIdsField];
-  if (typeof val === "string" && val.trim()) {
-    return val
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
+  const val = record.fields[cfg.fundField];
+  // Lookup fields return arrays
+  if (Array.isArray(val) && val.length > 0) {
+    const first = val[0];
+    if (typeof first === "string" && first.trim()) return first.trim();
   }
-  return [];
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return null;
 }
 
 /**
- * Read existing Box links stored on the record.
+ * Read the company code from a record.
+ * Handles both direct string values and lookup arrays (e.g. ["ABC123"]).
  */
-export function getExistingBoxLinks(record: AirtableRecord): string[] {
+export function getCompanyCode(record: AirtableRecord): string | null {
   const cfg = getAirtableConfig();
-  const val = record.fields[cfg.boxLinksField];
-  if (typeof val === "string" && val.trim()) {
-    return val
-      .split("\n")
-      .map((s) => s.trim())
-      .filter(Boolean);
+  const val = record.fields[cfg.companyCodeField];
+  // Lookup fields return arrays
+  if (Array.isArray(val) && val.length > 0) {
+    const first = val[0];
+    if (typeof first === "string" && first.trim()) return first.trim();
   }
-  return [];
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return null;
+}
+
+/**
+ * Read the company name (JP) from a record.
+ * Handles both direct string values and lookup arrays.
+ */
+export function getCompanyNameJp(record: AirtableRecord): string | null {
+  const cfg = getAirtableConfig();
+  const val = record.fields[cfg.companyNameJpField];
+  if (Array.isArray(val) && val.length > 0) {
+    const first = val[0];
+    if (typeof first === "string" && first.trim()) return first.trim();
+  }
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return null;
+}
+
+/**
+ * Read the submission period (提出期間) from a record.
+ * This is a Formula field, returns a string like "Q1 2025".
+ */
+export function getSubmissionPeriod(record: AirtableRecord): string | null {
+  const cfg = getAirtableConfig();
+  const val = record.fields[cfg.submissionPeriodField];
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return null;
 }
 
 /**
@@ -241,18 +307,16 @@ export async function setStatus(
 }
 
 /**
- * Write Box results (file IDs and shared links) back to Airtable.
+ * Write the Box folder URL and mark as Uploaded.
  */
-export async function writeBoxResults(
+export async function writeBoxResult(
   recordId: string,
-  boxIds: string[],
-  boxLinks: string[],
+  boxFolderUrl: string,
   log: Logger
 ): Promise<void> {
   const cfg = getAirtableConfig();
   const fields: Record<string, unknown> = {
-    [cfg.boxIdsField]: boxIds.join("\n"),
-    [cfg.boxLinksField]: boxLinks.join("\n"),
+    [cfg.boxFilePathField]: boxFolderUrl,
     [cfg.statusField]: "Uploaded" as ProcessingStatus,
     [cfg.errorField]: "",
   };
@@ -263,12 +327,6 @@ export async function writeBoxResults(
  * Download an attachment from Airtable's CDN and return the response
  * as a readable stream. Airtable attachment URLs are time-limited
  * signed URLs; they must be consumed promptly.
- *
- * VERCEL LIMIT: Vercel serverless functions have a ~4.5 MB response body
- * and ~50 MB payload limit (varies by plan). For very large files the
- * download may be cut short. This implementation streams the response
- * body so memory stays low, but the total transfer is still bounded by
- * Vercel's execution-time and payload limits.
  */
 export async function downloadAttachmentStream(
   attachmentUrl: string,

@@ -5,15 +5,18 @@ import { validateWebhook } from "../utils/validation";
 import { checkIdempotency } from "../services/idempotency";
 import {
   downloadAttachmentStream,
-  getAttachments,
+  getAllAttachments,
+  getCompanyCode,
+  getCompanyNameJp,
+  getFundName,
+  getSubmissionPeriod,
   setStatus,
-  writeBoxResults,
+  writeBoxResult,
 } from "../services/airtable";
 import {
   buildFileName,
   createSharedLink,
   ensureSubfolder,
-  getMonthFolder,
   uploadFile,
   BoxFile,
 } from "../services/box";
@@ -45,16 +48,6 @@ router.post("/webhook", async (req: Request, res: Response) => {
   log.info(`Webhook received for record ${recordId}`);
 
   // ── Respond early ───────────────────────────────────────────────────────
-  // On Vercel, the function keeps running after res.json() until the
-  // handler's returned Promise resolves or the execution time limit is hit.
-  // Vercel's Node.js runtime waits for the handler to finish before
-  // terminating the invocation. We respond with 200 immediately so the
-  // caller (Airtable Automation) does not time out, then continue
-  // processing in the same execution context.
-  //
-  // IMPORTANT: If execution time exceeds Vercel's limit (10s Hobby,
-  // 60s Pro, 300s Enterprise), the function will be killed mid-flight.
-  // For very large files, consider an external queue or Vercel Cron.
   res.status(200).json({
     ok: true,
     requestId,
@@ -97,49 +90,96 @@ async function processRecord(
   }
 
   const record = idem.record;
-  const attachments = getAttachments(record);
+  const attachments = getAllAttachments(record);
 
   if (attachments.length === 0) {
     rlog.info("No attachments found, marking as Uploaded");
-    await writeBoxResults(recordId, [], [], rlog);
+    await writeBoxResult(recordId, "", rlog);
     return;
   }
 
-  rlog.info(`Found ${attachments.length} attachment(s) to process`);
+  // ── Extract fund, company, and period info ─────────────────────────────
+  const fundName = getFundName(record);
+  if (!fundName) {
+    throw new Error(
+      "Fund field is empty — cannot determine target folder. " +
+        "Ensure the lookup field is configured on the ドキュメント収集管理 table."
+    );
+  }
 
-  // ── Ensure target subfolder (YYYY-MM) ───────────────────────────────────
+  const companyCode = getCompanyCode(record);
+  if (!companyCode) {
+    throw new Error(
+      "CompanyCode field is empty — cannot build filename. " +
+        "Ensure the lookup field is configured on the ドキュメント収集管理 table."
+    );
+  }
+
+  const companyNameJp = getCompanyNameJp(record);
+  if (!companyNameJp) {
+    throw new Error(
+      "Company Name (JP) field is empty — cannot create subfolder. " +
+        "Ensure the lookup field is configured on the ドキュメント収集管理 table."
+    );
+  }
+
+  const submissionPeriod = getSubmissionPeriod(record);
+  if (!submissionPeriod) {
+    throw new Error("提出期間 field is empty — cannot create subfolder.");
+  }
+
+  rlog.info(
+    `Found ${attachments.length} attachment(s) ` +
+      `(fund: ${fundName}, company: ${companyNameJp} [${companyCode}], period: ${submissionPeriod})`
+  );
+
+  // ── Ensure target subfolders: Fund → Company → Period ─────────────────
+  // Structure: BOX_TARGET_FOLDER_ID / 4号 / ABC123_サンプル株式会社 / Q1 2025 / files
   const targetFolderId = process.env.BOX_TARGET_FOLDER_ID;
   if (!targetFolderId) throw new Error("BOX_TARGET_FOLDER_ID not set");
 
-  const monthFolder = getMonthFolder();
+  const fundFolderId = await ensureSubfolder(targetFolderId, fundName, rlog);
+
+  // Sanitize folder names for Box
+  const companyFolderName = `${companyCode}_${companyNameJp}`.replace(
+    /[/\\:*?"<>|]/g,
+    "_"
+  );
+  const companyFolderId = await ensureSubfolder(
+    fundFolderId,
+    companyFolderName,
+    rlog
+  );
+
+  const periodFolderName = submissionPeriod.replace(/[/\\:*?"<>|]/g, "_");
   const uploadFolderId = await ensureSubfolder(
-    targetFolderId,
-    monthFolder,
+    companyFolderId,
+    periodFolderName,
     rlog
   );
 
   // ── Process each attachment ─────────────────────────────────────────────
-  // Carry forward any already-uploaded results (partial completion support)
-  const boxIds: string[] = [...idem.existingBoxIds];
-  const boxLinks: string[] = [...idem.existingBoxLinks];
+  // Track how many files per field for index suffix (when multiple files in one field)
+  const fieldFileCount = new Map<string, number>();
+  let uploadedCount = 0;
 
   for (let i = 0; i < attachments.length; i++) {
     const att = attachments[i];
-
-    // Skip if already uploaded (idempotency for partial completion)
-    if (idem.alreadyUploadedFileNames.has(att.filename) && boxIds[i]) {
-      rlog.info(
-        `Skipping already-uploaded attachment ${i + 1}/${attachments.length}: ${att.filename}`
-      );
-      continue;
-    }
+    const indexInField = fieldFileCount.get(att.fieldName) ?? 0;
+    fieldFileCount.set(att.fieldName, indexInField + 1);
 
     rlog.info(
-      `Processing attachment ${i + 1}/${attachments.length}: ${att.filename} (${att.size} bytes)`
+      `Processing attachment ${i + 1}/${attachments.length}: ` +
+        `[${att.fieldName}] ${att.filename} (${att.size} bytes)`
     );
 
-    // Build the target file name
-    const boxFileName = buildFileName(recordId, att.filename);
+    // Build the target file name: CompanyCode_YYYY-MM-DD_fieldName.ext
+    const boxFileName = buildFileName(
+      companyCode,
+      att.fieldName,
+      att.filename,
+      indexInField
+    );
 
     // Download from Airtable CDN
     const { stream, contentLength } = await downloadAttachmentStream(
@@ -169,56 +209,21 @@ async function processRecord(
     }
 
     // Create shared link if configured
-    let sharedLinkUrl = boxFile.sharedLink;
-    if (!sharedLinkUrl) {
-      sharedLinkUrl = await createSharedLink(boxFile.id, rlog);
+    if (!boxFile.sharedLink) {
+      await createSharedLink(boxFile.id, rlog);
     }
 
-    // Store results (maintain positional alignment with attachments)
-    boxIds[i] = boxFile.id;
-    boxLinks[i] = sharedLinkUrl || `https://app.box.com/file/${boxFile.id}`;
-
+    uploadedCount++;
     rlog.info(
-      `Attachment ${i + 1}/${attachments.length} done: Box ID ${boxFile.id}`
+      `Attachment ${i + 1}/${attachments.length} done: ${boxFileName} → Box ID ${boxFile.id}`
     );
-
-    // Write intermediate results after each file so partial progress is saved
-    await writeIntermediateResults(recordId, boxIds, boxLinks, rlog);
   }
 
   // ── Final write ─────────────────────────────────────────────────────────
-  // Filter out any empty entries from sparse array
-  const finalIds = boxIds.filter(Boolean);
-  const finalLinks = boxLinks.filter(Boolean);
-
-  await writeBoxResults(recordId, finalIds, finalLinks, rlog);
+  const boxFolderUrl = `https://app.box.com/folder/${uploadFolderId}`;
+  await writeBoxResult(recordId, boxFolderUrl, rlog);
   rlog.info(
-    `Processing complete: ${finalIds.length} file(s) uploaded to Box`
-  );
-}
-
-/**
- * Write intermediate results to Airtable after each file upload.
- * This preserves partial progress if the function is killed mid-flight.
- * Status stays as "Processing" — only the final write sets "Uploaded".
- */
-async function writeIntermediateResults(
-  recordId: string,
-  boxIds: string[],
-  boxLinks: string[],
-  log: ReturnType<typeof createLogger>
-): Promise<void> {
-  const { updateRecord } = await import("../services/airtable");
-  const { getAirtableConfig } = await import("../services/airtable");
-  const cfg = getAirtableConfig();
-
-  await updateRecord(
-    recordId,
-    {
-      [cfg.boxIdsField]: boxIds.filter(Boolean).join("\n"),
-      [cfg.boxLinksField]: boxLinks.filter(Boolean).join("\n"),
-    },
-    log
+    `Processing complete: ${uploadedCount} file(s) uploaded to Box → ${boxFolderUrl}`
   );
 }
 

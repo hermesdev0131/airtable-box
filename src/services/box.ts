@@ -1,5 +1,4 @@
 import fetch, { Response } from "node-fetch";
-import * as jwt from "jsonwebtoken";
 import * as crypto from "crypto";
 import { Logger } from "../utils/logger";
 
@@ -25,24 +24,23 @@ interface BoxUploadEntry {
 // ── Config ──────────────────────────────────────────────────────────────────
 
 interface BoxConfig {
+  /** When set, skip CCG auth and use this token directly (for local testing) */
+  developerToken: string | null;
   clientId: string;
   clientSecret: string;
   enterpriseId: string;
-  jwtPrivateKey: string;
-  jwtPrivateKeyId: string;
-  publicKeyId: string;
   targetFolderId: string;
   sharedLinkAccess: string | null;
 }
 
 function getBoxConfig(): BoxConfig {
+  const developerToken = process.env.BOX_DEVELOPER_TOKEN || null;
+
   return {
-    clientId: requireEnv("BOX_CLIENT_ID"),
-    clientSecret: requireEnv("BOX_CLIENT_SECRET"),
-    enterpriseId: requireEnv("BOX_ENTERPRISE_ID"),
-    jwtPrivateKey: requireEnv("BOX_JWT_PRIVATE_KEY").replace(/\\n/g, "\n"),
-    jwtPrivateKeyId: requireEnv("BOX_JWT_PRIVATE_KEY_ID"),
-    publicKeyId: requireEnv("BOX_PUBLIC_KEY_ID"),
+    developerToken,
+    clientId: developerToken ? (process.env.BOX_CLIENT_ID || "") : requireEnv("BOX_CLIENT_ID"),
+    clientSecret: developerToken ? (process.env.BOX_CLIENT_SECRET || "") : requireEnv("BOX_CLIENT_SECRET"),
+    enterpriseId: developerToken ? (process.env.BOX_ENTERPRISE_ID || "") : requireEnv("BOX_ENTERPRISE_ID"),
     targetFolderId: requireEnv("BOX_TARGET_FOLDER_ID"),
     sharedLinkAccess: process.env.BOX_SHARED_LINK_ACCESS || null,
   };
@@ -60,36 +58,31 @@ let cachedToken: string | null = null;
 let tokenExpiresAt = 0;
 
 /**
- * Obtain a Box access token using JWT (Server Auth with JWT).
+ * Obtain a Box access token.
+ *
+ * If BOX_DEVELOPER_TOKEN is set, uses it directly (for local testing).
+ * Otherwise, uses CCG (Client Credentials Grant) for server-to-server auth.
  * Tokens are cached in-memory for the duration of the serverless
  * cold-start (up to their expiry minus a 60s buffer).
  */
 async function getAccessToken(log: Logger): Promise<string> {
+  const cfg = getBoxConfig();
+
+  // Developer token mode — use directly, no caching needed
+  if (cfg.developerToken) {
+    return cfg.developerToken;
+  }
+
   if (cachedToken && Date.now() < tokenExpiresAt) {
     return cachedToken;
   }
 
-  const cfg = getBoxConfig();
-
-  const claims = {
-    iss: cfg.clientId,
-    sub: cfg.enterpriseId,
-    box_sub_type: "enterprise",
-    aud: "https://api.box.com/oauth2/token",
-    jti: crypto.randomBytes(32).toString("hex"),
-    exp: Math.floor(Date.now() / 1000) + 45, // 45 second expiry for assertion
-  };
-
-  const assertion = jwt.sign(claims, cfg.jwtPrivateKey, {
-    algorithm: "RS256",
-    keyid: cfg.publicKeyId,
-  });
-
   const body = new URLSearchParams({
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    assertion,
+    grant_type: "client_credentials",
     client_id: cfg.clientId,
     client_secret: cfg.clientSecret,
+    box_subject_type: "enterprise",
+    box_subject_id: cfg.enterpriseId,
   });
 
   const resp = await fetch("https://api.box.com/oauth2/token", {
@@ -100,7 +93,7 @@ async function getAccessToken(log: Logger): Promise<string> {
 
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`Box JWT auth failed (${resp.status}): ${text}`);
+    throw new Error(`Box CCG auth failed (${resp.status}): ${text}`);
   }
 
   const data = (await resp.json()) as BoxTokenResponse;
@@ -108,7 +101,7 @@ async function getAccessToken(log: Logger): Promise<string> {
   // Cache until 60 seconds before actual expiry
   tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
 
-  log.info("Box JWT token obtained");
+  log.info("Box CCG token obtained");
   return cachedToken;
 }
 
@@ -383,13 +376,30 @@ export async function createSharedLink(
 // ── File naming ─────────────────────────────────────────────────────────────
 
 /**
- * Build a standardized file name:  YYYY-MM-DD_recXXX_originalName.ext
+ * Build a standardized file name:  CompanyCode_YYYY-MM-DD_fieldName.ext
+ *
+ * Extension is taken from the original uploaded filename.
+ * If multiple files exist in the same field, a suffix index is appended.
+ * e.g. ABC123_2026-03-01_株主名簿（最新版）.pdf
+ *      ABC123_2026-03-01_株主名簿（最新版）_2.pdf
  */
-export function buildFileName(recordId: string, originalName: string): string {
+export function buildFileName(
+  companyCode: string,
+  fieldName: string,
+  originalName: string,
+  indexInField?: number
+): string {
   const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-  // Sanitize original name: replace characters invalid for Box
-  const safe = originalName.replace(/[/\\:*?"<>|]/g, "_");
-  return `${date}_${recordId}_${safe}`;
+
+  // Extract extension from original filename
+  const dotIdx = originalName.lastIndexOf(".");
+  const ext = dotIdx >= 0 ? originalName.slice(dotIdx) : "";
+
+  // Sanitize field name: replace characters invalid for Box
+  const safeField = fieldName.replace(/[/\\:*?"<>|]/g, "_");
+
+  const suffix = indexInField !== undefined && indexInField > 0 ? `_${indexInField + 1}` : "";
+  return `${companyCode}_${date}_${safeField}${suffix}${ext}`;
 }
 
 /**
