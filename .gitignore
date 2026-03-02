@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.env.*
 .vercel
 *.log
-.env.*
+.claude/settings.local.json
