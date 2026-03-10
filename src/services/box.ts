@@ -284,20 +284,15 @@ export async function uploadFile(
     log
   );
 
-  // 409 → file with same name exists in folder
+  // 409 → file with same name exists — upload as new version
   if (resp.status === 409) {
     const conflict = (await resp.json()) as {
       context_info?: { conflicts?: { id: string } };
     };
     const existingId = conflict.context_info?.conflicts?.id;
     if (existingId) {
-      log.info(`Box file "${fileName}" already exists → ${existingId}`);
-      // Return existing file — caller can decide to skip or handle
-      return {
-        id: existingId,
-        name: fileName,
-        sharedLink: null,
-      };
+      log.info(`Box file "${fileName}" already exists (${existingId}), uploading new version`);
+      return uploadNewVersion(existingId, fileName, fileBuffer, log);
     }
     const text = JSON.stringify(conflict);
     throw new Error(`Box upload 409 conflict: ${text}`);
@@ -314,6 +309,58 @@ export async function uploadFile(
 
   log.info(`Uploaded to Box: ${entry.name} → ${entry.id}`);
 
+  return {
+    id: entry.id,
+    name: entry.name,
+    sharedLink: entry.shared_link?.url ?? null,
+  };
+}
+
+/**
+ * Upload a new version of an existing Box file.
+ * Uses the Box Upload New Version API: POST /files/:id/content
+ */
+async function uploadNewVersion(
+  fileId: string,
+  fileName: string,
+  fileBuffer: Buffer,
+  log: Logger
+): Promise<BoxFile> {
+  const token = await getAccessToken(log);
+  const boundary = `----BoxVersion${crypto.randomBytes(16).toString("hex")}`;
+
+  const preamble = Buffer.from(
+    `--${boundary}\r\n` +
+      `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n` +
+      `Content-Type: application/octet-stream\r\n\r\n`
+  );
+  const epilogue = Buffer.from(`\r\n--${boundary}--\r\n`);
+  const body = Buffer.concat([preamble, fileBuffer, epilogue]);
+
+  const resp = await boxApiFetch(
+    `https://upload.box.com/api/2.0/files/${fileId}/content`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": String(body.length),
+      },
+      body,
+    },
+    log
+  );
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Box version upload failed (${resp.status}): ${text}`);
+  }
+
+  const data = (await resp.json()) as { entries: BoxUploadEntry[] };
+  const entry = data.entries[0];
+  if (!entry) throw new Error("Box version upload returned no entries");
+
+  log.info(`Uploaded new version to Box: ${entry.name} → ${entry.id}`);
   return {
     id: entry.id,
     name: entry.name,
@@ -376,30 +423,44 @@ export async function createSharedLink(
 // ── File naming ─────────────────────────────────────────────────────────────
 
 /**
- * Build a standardized file name:  CompanyCode_YYYY-MM-DD_fieldName.ext
+ * Build a standardized file name.
  *
- * Extension is taken from the original uploaded filename.
- * If multiple files exist in the same field, a suffix index is appended.
- * e.g. ABC123_2026-03-01_株主名簿（最新版）.pdf
- *      ABC123_2026-03-01_株主名簿（最新版）_2.pdf
+ * Format: CompanyCode_CompanyName_YYYY-MM-DD_[targetYearMonth_]fieldName.ext
+ *
+ * When targetYearMonth is provided:
+ *   6_1_株式会社アンドパッド_2026-03-10_2026年3月_PL・誓約書.pdf
+ *
+ * When targetYearMonth is absent:
+ *   6_1_株式会社アンドパッド_2026-03-10_PL・誓約書.pdf
  */
 export function buildFileName(
   companyCode: string,
   fieldName: string,
   originalName: string,
-  indexInField?: number
+  indexInField?: number,
+  options?: {
+    companyNameJp?: string;
+    targetYearMonth?: string;
+  }
 ): string {
-  const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-
-  // Extract extension from original filename
   const dotIdx = originalName.lastIndexOf(".");
   const ext = dotIdx >= 0 ? originalName.slice(dotIdx) : "";
 
-  // Sanitize field name: replace characters invalid for Box
   const safeField = fieldName.replace(/[/\\:*?"<>|]/g, "_");
-
   const suffix = indexInField !== undefined && indexInField > 0 ? `_${indexInField + 1}` : "";
-  return `${companyCode}_${date}_${safeField}${suffix}${ext}`;
+  const date = new Date().toISOString().slice(0, 10);
+
+  const parts = [companyCode];
+  if (options?.companyNameJp) {
+    parts.push(options.companyNameJp.replace(/[/\\:*?"<>|]/g, "_"));
+  }
+  parts.push(date);
+  if (options?.targetYearMonth) {
+    parts.push(options.targetYearMonth.replace(/[/\\:*?"<>|]/g, "_"));
+  }
+  parts.push(`${safeField}${suffix}`);
+
+  return `${parts.join("_")}${ext}`;
 }
 
 /**

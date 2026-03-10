@@ -35,6 +35,7 @@ interface AirtableConfig {
   companyCodeField: string;
   companyNameJpField: string;
   submissionPeriodField: string;
+  targetYearMonthField: string;
 }
 
 const DEFAULT_ATTACHMENT_FIELDS = [
@@ -68,6 +69,8 @@ export function getAirtableConfig(): AirtableConfig {
       "Company Name (JP) / 会社名（日本語） (from 会社名)",
     submissionPeriodField:
       process.env.AIRTABLE_SUBMISSION_PERIOD_FIELD || "提出期間",
+    targetYearMonthField:
+      process.env.AIRTABLE_TARGET_YEAR_MONTH_FIELD || "対象年月",
   };
 }
 
@@ -260,6 +263,21 @@ export function getCompanyNameJp(record: AirtableRecord): string | null {
 export function getSubmissionPeriod(record: AirtableRecord): string | null {
   const cfg = getAirtableConfig();
   const val = record.fields[cfg.submissionPeriodField];
+  if (typeof val === "string" && val.trim()) return val.trim();
+  return null;
+}
+
+/**
+ * Read the target year/month (対象年月) from a record.
+ * Example values: "2026年3月", "2025年12月"
+ */
+export function getTargetYearMonth(record: AirtableRecord): string | null {
+  const cfg = getAirtableConfig();
+  const val = record.fields[cfg.targetYearMonthField];
+  if (Array.isArray(val) && val.length > 0) {
+    const first = val[0];
+    if (typeof first === "string" && first.trim()) return first.trim();
+  }
   if (typeof val === "string" && val.trim()) return val.trim();
   return null;
 }

@@ -10,6 +10,7 @@ import {
   getCompanyNameJp,
   getFundName,
   getSubmissionPeriod,
+  getTargetYearMonth,
   setStatus,
   writeBoxResult,
 } from "../services/airtable";
@@ -134,9 +135,13 @@ async function processRecord(
     throw new Error("提出期間 field is empty — cannot create subfolder.");
   }
 
+  const targetYearMonth = getTargetYearMonth(record);
+
   rlog.info(
     `Found ${attachments.length} attachment(s) ` +
-      `(fund: ${fundName}, company: ${companyNameJp} [${companyCode}], period: ${submissionPeriod})`
+      `(fund: ${fundName}, company: ${companyNameJp} [${companyCode}], ` +
+      `period: ${submissionPeriod}` +
+      `${targetYearMonth ? `, targetYM: ${targetYearMonth}` : ""})`
   );
 
   // ── Ensure target subfolders: Fund → Company → Period ─────────────────
@@ -179,12 +184,16 @@ async function processRecord(
         `[${att.fieldName}] ${att.filename} (${att.size} bytes)`
     );
 
-    // Build the target file name: CompanyCode_YYYY-MM-DD_fieldName.ext
+    // Build the target file name
     const boxFileName = buildFileName(
       companyCode,
       att.fieldName,
       att.filename,
-      indexInField
+      indexInField,
+      {
+        companyNameJp,
+        targetYearMonth: targetYearMonth ?? undefined,
+      }
     );
 
     // Download from Airtable CDN
