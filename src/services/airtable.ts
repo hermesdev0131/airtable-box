@@ -39,11 +39,11 @@ interface AirtableConfig {
 }
 
 const DEFAULT_ATTACHMENT_FIELDS = [
-  " 株主名簿（最新版）",
-  "PL・誓約書",
-  "バランスシート・誓約書",
+  "株主名簿（最新版）",
+  "PL",
+  "BS",
   "商業登記簿",
-  "新株予約権原簿を",
+  "新株予約権原簿",
 ];
 
 export function getAirtableConfig(): AirtableConfig {
